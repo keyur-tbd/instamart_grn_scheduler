@@ -50,7 +50,7 @@ CONFIG = {
         'sender': '',
         'search_term': 'grn & purchase return',
         'attachment_filter': 'GRN',
-        'days_back': 15,
+        'days_back': 5,
         'max_results': 1000
     },
     'sheet': {
@@ -59,7 +59,7 @@ CONFIG = {
         'drive_folder_id': '19basSTaOUB-X0FlrwmBkeVULgE8nBQ5x',
         'spreadsheet_id': '16WLcJKfkSLkTj1io962aSkgTGbk09PMdJTgkWNn11fw',
         'sheet_range': 'instamartgrn',
-        'days_back': 15,
+        'days_back': 30,
         'max_files': 1000
     },
     'workflow_log': {
