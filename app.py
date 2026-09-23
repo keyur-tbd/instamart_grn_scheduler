@@ -262,11 +262,22 @@ class InstamartAutomation:
             query = " ".join(query_parts)
             self.log(f"[SEARCH] Searching Gmail with query: {query}")
             
-            result = self.gmail_service.users().messages().list(
-                userId='me', q=query, maxResults=max_results
-            ).execute()
-            
-            messages = result.get('messages', [])
+            # Gmail returns at most 500 ids per page whatever maxResults says, so
+            # without following nextPageToken a busy 15-day window would silently
+            # drop the oldest mails. Page until max_results or the end.
+            messages = []
+            page_token = None
+            while len(messages) < max_results:
+                result = self.gmail_service.users().messages().list(
+                    userId='me', q=query, pageToken=page_token,
+                    maxResults=min(500, max_results - len(messages))
+                ).execute()
+                messages.extend(result.get('messages', []))
+                page_token = result.get('nextPageToken')
+                if not page_token:
+                    break
+            if page_token:
+                self.log(f"[WARNING] Hit max_results={max_results}; older matching mails were not read")
             self.log(f"[SEARCH] Found {len(messages)} emails matching criteria")
             
             return messages
