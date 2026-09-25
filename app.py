@@ -51,7 +51,7 @@ CONFIG = {
         'sender': '',
         'search_term': 'grn & purchase return',
         'attachment_filter': 'GRN',
-        'days_back': 15,
+        'days_back': 21,
         'max_results': 1000
     },
     'sheet': {
