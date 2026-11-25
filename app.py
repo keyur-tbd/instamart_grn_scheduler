@@ -23,6 +23,8 @@ from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseUpload
 import io
 from etl_alerts import guard
+from types import SimpleNamespace
+import instamart_pdf
 
 # Add LlamaParse import
 try:
@@ -716,7 +718,27 @@ class InstamartAutomation:
         return default
     
     def safe_extract(self, agent, file_path: str, retries: int = 3, wait_time: int = 2):
-        """Retry-safe extraction to handle server disconnections"""
+        """The GRN's lines, read from the PDF's text when they add up to its printed Total row, else LlamaExtract.
+
+        LlamaExtract kept only one line when a SKU was received in two lots (old + new MRP): on 27BLR-01860 it kept
+        the 0-received lot of SKUs 96122 and 198729 and dropped the received one, so the claims showed 160 units
+        short on a GRN that received everything (2026-11-25). The local parse is checked against the Total row
+        (Sr. No. contiguous, received qty and grand total equal) and returns one line per SKU (instamart_pdf.per_sku:
+        received summed over the lots, expected qty once). It costs no LlamaCloud credits. supabase_sink.py calls
+        this same method, so the sheet and Supabase get the same lines."""
+        try:
+            parsed = instamart_pdf.parse(file_path)
+            issue = instamart_pdf.check(parsed)
+            if issue is None:
+                items = instamart_pdf.per_sku(parsed)
+                for it in items:
+                    it['lots'] = json.dumps(it['lots'])
+                self.log(f"Read {len(parsed['items'])} line(s) / {len(items)} SKU(s) from the PDF text; they add up "
+                         f"to the GRN Total row, no LlamaExtract call")
+                return SimpleNamespace(data=dict(parsed['header'], items=items, parsed_by='instamart_pdf'))
+            self.log(f"PDF text parse not used ({issue}); falling back to LlamaExtract", "WARNING")
+        except Exception as e:
+            self.log(f"PDF text parse failed ({e}); falling back to LlamaExtract", "WARNING")
         for attempt in range(1, retries + 1):
             try:
                 result = agent.extract(file_path)
@@ -756,7 +778,8 @@ class InstamartAutomation:
             "invoice_date": self.get_value(extracted_data, ["invoice_date", "invoice_dt"]),
             "source_file": file_info['name'],
             "processed_date": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "drive_file_id": file_info['id']
+            "drive_file_id": file_info['id'],
+            "parsed_by": extracted_data.get("parsed_by", "")
         }
         
         # Process each item
@@ -778,7 +801,8 @@ class InstamartAutomation:
                 "unit_price": self.get_value(item, ["unit_price", "price_per_unit", "rate"]),
                 "taxable_value": self.get_value(item, ["taxable_value", "taxable_amt"]),
                 "add_cess": self.get_value(item, ["add_cess", "additional_cess"]),
-                "total_inr": self.get_value(item, ["total_inr", "total_amount", "amount"])
+                "total_inr": self.get_value(item, ["total_inr", "total_amount", "amount"]),
+                "lots": self.get_value(item, ["lots"])
             })
             
             # Only keep non-empty values
