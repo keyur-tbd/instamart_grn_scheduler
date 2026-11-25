@@ -12,7 +12,8 @@ Gmail  --->  Google Drive  --->  LlamaParse  --->  Google Sheets
 | Stage | What happens |
 |---|---|
 | **1. Gmail -> Drive** | Searches mail from `(any sender)` matching `grn & purchase return`, looking back 15 days, and saves each attachment to a Drive folder. Already-seen files are skipped. |
-| **2. Extract** | Each new file is parsed by **LlamaParse** using the LlamaCloud extract agent `Instamart Agent`. |
+| **2. Extract** | Each new file is read from the PDF text by `instamart_pdf.py` and checked against the GRN's printed Total row (Sr. No. contiguous, received qty and grand total equal); one row per SKU (lots summed, kept in `lots`), `parsed_by = instamart_pdf`. Only when that check fails is LlamaCloud agent `Instamart Agent` called, and its lines are checked the same way: `parsed_by` says `llamaextract (checked ...)` or `llamaextract UNCHECKED: <why>`. |
+| **Revisions** | A GRN re-sent under the same name with different bytes is saved as `<name>__rev<UTC stamp>.pdf`; the sink loads it and deletes the earlier version's rows for that `grn_no` (`SourceSpec.supersede`). |
 | **3. Sheets** | Rows are appended to tab `instamartgrn` of the tracking spreadsheet. |
 | **4. Supabase** | `supabase_sink.py --run --source instamart` writes the same rows to table `instamart_grn`. Any field without a typed column is preserved in `raw_data` (jsonb), so a renamed or new field never fails a run. |
 | **5. Run log** | A per-run summary is appended to tab `workflow_logs`. |

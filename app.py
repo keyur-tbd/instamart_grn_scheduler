@@ -13,6 +13,7 @@ import schedule
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 import re
+import hashlib
 import warnings
 
 from google.oauth2.credentials import Credentials
@@ -381,13 +382,22 @@ class InstamartAutomation:
     def upload_to_drive(self, file_data: bytes, filename: str, folder_id: str) -> bool:
         """Upload file to Google Drive"""
         try:
-            query = f"name='{filename}' and '{folder_id}' in parents and trashed=false"
-            existing = self.drive_service.files().list(q=query, fields='files(id, name)').execute()
-            files = existing.get('files', [])
-            
+            # A GRN re-sent under the same name with different content is a revision: keep it as
+            # '<name>__rev<UTC stamp>.pdf' so the Drive -> Supabase step loads it (supabase_sink then drops the
+            # older version's rows for that GRN). Identical bytes (same md5) are still skipped.
+            stem, ext = os.path.splitext(filename)
+            safe_stem = stem.replace("\\", "\\\\").replace("'", "\\'")
+            query = f"name contains '{safe_stem}' and '{folder_id}' in parents and trashed=false"
+            existing = self.drive_service.files().list(q=query, fields='files(id, name, md5Checksum)').execute()
+            files = [f for f in existing.get('files', [])
+                     if f['name'] == filename or f['name'].startswith(stem + '__rev')]
             if files:
-                self.log(f"[DRIVE] File already exists, skipping: {filename}")
-                return True
+                md5 = hashlib.md5(file_data).hexdigest()
+                if any(f.get('md5Checksum') == md5 for f in files):
+                    self.log(f"[DRIVE] File already exists, skipping: {filename}")
+                    return True
+                filename = f"{stem}__rev{datetime.now(timezone.utc).strftime('%Y%m%d%H%M')}{ext}"
+                self.log(f"[DRIVE] {stem}{ext} exists with different content; saving the revision as {filename}", "WARNING")
             
             file_metadata = {
                 'name': filename,
@@ -735,19 +745,52 @@ class InstamartAutomation:
                     it['lots'] = json.dumps(it['lots'])
                 self.log(f"Read {len(parsed['items'])} line(s) / {len(items)} SKU(s) from the PDF text; they add up "
                          f"to the GRN Total row, no LlamaExtract call")
+                self.last_extract_issue = None
                 return SimpleNamespace(data=dict(parsed['header'], items=items, parsed_by='instamart_pdf'))
             self.log(f"PDF text parse not used ({issue}); falling back to LlamaExtract", "WARNING")
         except Exception as e:
+            parsed, issue = None, f"PDF text parse failed: {e}"
             self.log(f"PDF text parse failed ({e}); falling back to LlamaExtract", "WARNING")
         for attempt in range(1, retries + 1):
             try:
                 result = agent.extract(file_path)
+                self._tag_fallback(result, parsed, issue)
                 return result
             except Exception as e:
                 self.log(f"Attempt {attempt} failed for {file_path}: {e}")
                 time.sleep(wait_time)
         raise Exception(f"Extraction failed after {retries} attempts for {file_path}")
     
+    def _tag_fallback(self, result, parsed, local_issue):
+        """Check LlamaExtract's lines against the GRN's printed Total row and tag every line with the outcome in
+        parsed_by, so a fallback load is never silent: 'llamaextract (checked)' when the received qty and grand
+        total match, else 'llamaextract UNCHECKED: <why>'. Query: raw_data->>'parsed_by' like 'llamaextract UNCHECKED%'."""
+        chunks = result if isinstance(result, list) else [result]
+        datas = [getattr(r, 'data', r) for r in chunks]
+        datas = [d for d in datas if isinstance(d, dict)]
+        items = [it for d in datas for it in (d.get('items') or d.get('product_items') or d.get('line_items') or [])
+                 if isinstance(it, dict)]
+        total = (parsed or {}).get('total')
+        def num(v):
+            try:
+                return float(str(v).replace(',', ''))
+            except (TypeError, ValueError):
+                return 0.0
+        if not total:
+            tag = f"llamaextract UNCHECKED: no Total row in the PDF text ({local_issue})"
+        else:
+            recv = sum(num(it.get('recv_qty') or it.get('received_quantity')) for it in items)
+            grand = sum(num(it.get('total_inr') or it.get('total_amount')) for it in items)
+            if abs(recv - total['recv']) > 0.001 or abs(grand - total['grand']) > 1.0:
+                tag = (f"llamaextract UNCHECKED: lines add up to recv {recv:g} / Rs {grand:.2f}, "
+                       f"the GRN prints {total['recv']:g} / Rs {total['grand']:.2f}")
+            else:
+                tag = 'llamaextract (checked against the Total row)'
+        self.last_extract_issue = None if tag.startswith('llamaextract (checked') else tag
+        self.log(tag, "INFO" if self.last_extract_issue is None else "WARNING")
+        for d in datas:
+            d['parsed_by'] = tag
+
     def process_extracted_data(self, extracted_data: Dict, file_info: Dict) -> List[Dict]:
         """Process extracted data to match the specified JSON structure"""
         rows = []

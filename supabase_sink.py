@@ -138,7 +138,10 @@ class SourceSpec:
                  numeric: Sequence[str] = (), drop: Sequence[str] = (),
                  rename: Optional[Dict[str, str]] = None, note: str = '',
                  kind: str = 'pdf', dedupe: Sequence[str] = (),
-                 exclude: Optional[Tuple[str, str]] = None):
+                 exclude: Optional[Tuple[str, str]] = None, supersede: Optional[str] = None):
+        #: Field naming the document (e.g. 'grn_no'). A later version of the same document, saved by app.py as
+        #: '<name>__rev<UTC stamp>.pdf', replaces the earlier version's rows instead of adding to them.
+        self.supersede = supersede
         #: (field, regex): an extracted document whose rows all match is not this
         #: source's document type and is skipped, not loaded and not a failure.
         self.exclude = exclude
@@ -186,6 +189,7 @@ SOURCES: Dict[str, SourceSpec] = {
         date=['po_date', 'grn_date', 'invoice_date'],
         numeric=['lot_mrp', 'exp_qty', 'recv_qty', 'unit_price',
                  'taxable_value', 'add_cess', 'total_inr'],
+        supersede='grn_no',
     ),
     'mraws': SourceSpec(
         table='mraws_grn',
@@ -1085,6 +1089,21 @@ class SupabaseSink:
             logger.error('[SUPABASE] Failed to log workflow run: %s', exc)
             return False
 
+    def other_versions(self, rows: Sequence[Dict[str, Any]], source_file: str) -> List[Tuple[str, str]]:
+        """(source_file, document key) of rows already loaded for the same document from another file."""
+        field = self.spec.supersede
+        keys = sorted({str(r.get(field)) for r in rows if r.get(field)})
+        if not field or not keys:
+            return []
+        res = (self.client.table(self.grn_table).select(f'source_file,{field}')
+               .in_(field, keys).execute())
+        return sorted({(r['source_file'], r[field]) for r in (res.data or [])
+                       if (r.get('source_file') or '').lower() != source_file.lower()})
+
+    def delete_document_version(self, source_file: str, key: str) -> None:
+        (self.client.table(self.grn_table).delete()
+         .eq('source_file', source_file).eq(self.spec.supersede, key).execute())
+
     def delete_by_source_file(self, source_file: str) -> None:
         self.client.table(self.grn_table).delete().eq('source_file', source_file).execute()
 
@@ -1522,6 +1541,12 @@ def normalize_extraction(extraction_result: Any) -> List[Any]:
 DEFAULT_CATCHUP_DAYS = 60
 
 
+def _revision(name: str) -> str:
+    """'' for an original file, the UTC stamp for app.py's '<name>__rev<YYYYmmddHHMM>.pdf' revisions."""
+    m = re.search(r'__rev(\d{12})', name or '')
+    return m.group(1) if m else ''
+
+
 def _sheet_cell_text(raw: Any, shown: Any) -> str:
     """A sheet cell as the extractor wrote it: raw digits (no 3.23E+12), but
     percentages and dates as displayed (raw values are 0.05 and date serials)."""
@@ -1737,7 +1762,21 @@ def run_pipeline(sink: SupabaseSink, days_back: Optional[int] = None,
                 logger.info('[DRY RUN] %s -> %d row(s)', pdf_file['name'], len(rows))
                 continue
 
+            others = sink.other_versions(rows, pdf_file['name']) if sink.spec.supersede else []
+            mine = _revision(pdf_file['name'])
+            if any(_revision(f) > mine for f, _ in others):
+                stats['superseded'] = stats.get('superseded', 0) + 1
+                logger.warning('[PIPELINE] %s: a later revision of this %s is already loaded; not loaded',
+                               pdf_file['name'], sink.spec.supersede)
+                continue
+
             written = sink.insert_rows(rows, deadline=deadline)
+            if written == len(rows):
+                for f, key in others:
+                    if _revision(f) < mine:
+                        sink.delete_document_version(f, key)
+                        logger.warning('[PIPELINE] %s %s: rows from %s replaced by revision %s',
+                                       sink.spec.supersede, key, f, pdf_file['name'])
             stats['rows_added'] += written
             if written == len(rows):
                 stats['processed_pdfs'] += 1
