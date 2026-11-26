@@ -1021,7 +1021,12 @@ class SupabaseSink:
                     result = (self.client.table(self.grn_table)
                               .upsert(list(batch), on_conflict='row_hash')
                               .execute())
-                    written += len(result.data or batch)
+                    # A batch that raised nothing was accepted whole. Do not count result.data: the
+                    # instamart_grn_merge_lots trigger folds a second lot of a SKU into the first lot's row
+                    # (or drops a line that row already holds), and PostgREST returns only the rows it
+                    # inserted -- counting those would report a clean file as a short write and stop the
+                    # older revision of a GRN being deleted.
+                    written += len(batch)
                     break
                 except Exception as exc:
                     if attempt == 3:
@@ -2160,11 +2165,15 @@ def cmd_self_test(sink: SupabaseSink) -> int:
             return 1
         print('OK: rows inserted and read back')
 
+        # The two sample lines are identical, so the instamart_grn_merge_lots trigger keeps one row
+        # (one line per lot / qty / amount); count what landed, then check a re-run adds nothing.
+        landed = (sink.client.table(sink.grn_table)
+                  .select('id', count='exact').eq('source_file', marker).execute()).count
         sink.insert_rows(rows)                  # same hashes -> must not duplicate
         result = (sink.client.table(sink.grn_table)
                   .select('id', count='exact').eq('source_file', marker).execute())
-        if result.count != len(rows):
-            print(f"FAIL: re-insert duplicated rows ({result.count} present, expected {len(rows)})")
+        if not landed or result.count != landed:
+            print(f"FAIL: re-insert duplicated rows ({result.count} present, expected {landed})")
             return 1
         print('OK: re-running is idempotent (upsert on row_hash)')
 
