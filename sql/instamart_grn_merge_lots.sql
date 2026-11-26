@@ -124,7 +124,15 @@ comment on function public.instamart_grn_merge_lots() is
 'is skipped. Why: o2c_grn_lines dedupes on qty without the lot, so two equal-qty lots counted once (27BLR-07859 '
 'read 78 short on a full GRN, 2026-11-26).';
 
-drop trigger if exists instamart_grn_merge_lots on public.instamart_grn;
-create trigger instamart_grn_merge_lots
-    before insert on public.instamart_grn
-    for each row execute function public.instamart_grn_merge_lots();
+-- create only when missing: DROP TRIGGER needs an ACCESS EXCLUSIVE lock and waits behind every reader (the o2c
+-- refresh reads this table for half an hour); CREATE TRIGGER takes SHARE ROW EXCLUSIVE, which readers do not block
+do $do$
+begin
+    if not exists (select 1 from pg_trigger where tgrelid = 'public.instamart_grn'::regclass
+                                             and tgname = 'instamart_grn_merge_lots') then
+        create trigger instamart_grn_merge_lots
+            before insert on public.instamart_grn
+            for each row execute function public.instamart_grn_merge_lots();
+    end if;
+end
+$do$;
